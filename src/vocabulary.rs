@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! The user's vocabulary, kept through the rewrite.
 //!
-//! A backend that declares `[capabilities] context = true` is handed the
-//! vocabulary of the dictation context in force, as an `x-stt-vocabulary`
-//! header: a JSON array of terms. S1-mini has nowhere to read it. Its input is
-//! the control line and the transcript, in the format it was trained on, and
-//! its model card is explicit that anything else makes it hallucinate. So the
-//! vocabulary is applied around the model instead:
+//! A model that declares `accepts_context = true` is handed the vocabulary of
+//! the dictation context in force, as an `x-stt-vocabulary` header: a JSON
+//! array of terms. S1-mini has nowhere to read it. Its input is the control
+//! line and the transcript, in the format it was trained on, and its model card
+//! is explicit that anything else makes it hallucinate. So the vocabulary is
+//! applied around the model instead:
 //!
 //! 1. Before the rewrite, each term in the transcript is written the way the
 //!    vocabulary spells it, matched without regard to case, spaces or
