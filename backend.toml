@@ -10,7 +10,7 @@
   # selected model is named by it.
   source      = "github.com/jorge-menjivar/super-stt-s1-mini"
   name        = "S1-mini"
-  version     = "0.2.1"
+  version     = "0.2.2"
   kind        = "subprocess"
   entrypoint  = "super-voice-backend-s1-mini"
   contract    = "v4"
