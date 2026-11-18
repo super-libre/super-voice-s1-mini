@@ -245,9 +245,15 @@ the system, less what was in use before the backend started.
 
 The 120-sentence transcript the E2E test sends is cut into four pieces, and
 both candle and Burn decode two of them to the 1024-token cap, repeating a
-dozen of the sentences: 11,664 characters come back for 9,972, identical
+dozen of the sentences: 11,664 characters came back for 9,972, identical
 between the two. That is the model running on past the end of a repetitive
 piece, not the port.
+
+A piece whose decode never ends its turn now comes back as it went in, so
+those two pieces are returned uncleaned: 9,731 characters for 9,972. The same
+holds for the shorter loop a take cut off mid-sentence falls into ("…is to
+allow users to allow them to allow them…"), which is stopped once a cycle of
+up to 16 tokens has repeated across 32, rather than at the cap.
 
 ## Provenance of details kept from the candle backend
 

@@ -6,7 +6,8 @@
 //! S1-mini is a fine-tune of Qwen3-0.6B. [`Engine::normalize`] builds the
 //! trained prompt around a transcript, decodes greedily until the end-of-turn
 //! token, and returns the text — chunking a transcript that overflows the
-//! model's input budget first (see [`crate::chunk`]).
+//! model's input budget first (see [`crate::chunk`]). A piece whose decode
+//! never ends its turn comes back as it went in.
 //!
 //! Everything here is synchronous and compute-bound, and the model is not
 //! `Send`, so it lives on [`crate::model_thread`] and the handlers send it
@@ -45,6 +46,21 @@ pub const INPUT_TOKEN_BUDGET: usize = 768;
 /// that fails to stop, so a runaway costs seconds rather than the daemon's
 /// whole timeout.
 pub const MAX_NEW_TOKENS: usize = 1024;
+
+/// Tokens a loop must cover before a decode is stopped for it: one short
+/// cycle, repeated until it spans this many.
+///
+/// A greedy decode that starts repeating itself never stops: each repeat makes
+/// the next more likely. Handed a take cut off mid-sentence ("…is to allow
+/// users"), the model carries the sentence on, and then writes "to allow them"
+/// until the cap. Long enough that the repeats dictation has of its own ("no
+/// no no", "very very") never reach it; short enough that a loop is stopped a
+/// few cycles in, not hundreds of tokens later.
+const LOOP_SPAN: usize = 32;
+
+/// The longest cycle, in tokens, a loop is looked for at. A phrase loops in a
+/// few tokens; a loop of whole sentences is left to the cap.
+const MAX_LOOP_PERIOD: usize = 16;
 
 /// Prompt lengths, in tokens, the warm-up decodes after on a GPU.
 ///
@@ -613,7 +629,13 @@ impl Engine {
         let mut outputs = Vec::with_capacity(pieces.len());
         for piece in &pieces {
             let prompt = format_prompt(piece, control);
-            outputs.push(self.generate(&prompt, cancel)?);
+            // A decode that never ended its turn ran on past the piece, and
+            // what it wrote after the piece is not what the user said. The
+            // piece keeps its words, uncleaned, and the rest still are.
+            let output = self
+                .generate(&prompt, cancel)?
+                .unwrap_or_else(|| piece.clone());
+            outputs.push(output);
         }
         Ok(chunk::join(&outputs))
     }
@@ -630,7 +652,10 @@ impl Engine {
     /// S1-mini is trained for greedy decoding; sampling only adds variance.
     /// Every request is a fresh conversation: the prefill writes the caches
     /// from position 0, and nothing of the last request is attended to.
-    fn generate(&mut self, prompt: &str, cancel: &AtomicBool) -> Result<String> {
+    ///
+    /// `None` when the decode never ends its turn: it falls into a loop (see
+    /// [`LOOP_SPAN`]), or runs to its cap.
+    fn generate(&mut self, prompt: &str, cancel: &AtomicBool) -> Result<Option<String>> {
         // A cancel between the pieces of a long transcript spares the rest
         // their prefills.
         if cancel.load(Ordering::SeqCst) {
@@ -650,24 +675,37 @@ impl Engine {
 
         let start = std::time::Instant::now();
         let mut cancelled = false;
+        let mut looped = false;
+        let mut chosen = Vec::new();
         let generated = self
             .model
-            .generate(&prompt_tokens, max_new, &self.stop_tokens, |_| {
+            .generate(&prompt_tokens, max_new, &self.stop_tokens, |token| {
                 if cancel.load(Ordering::SeqCst) {
                     cancelled = true;
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
+                    return ControlFlow::Break(());
                 }
+                chosen.push(token);
+                if loops(&chosen) {
+                    looped = true;
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
             });
         if cancelled {
             bail!("cancelled");
         }
-        if generated.len() >= max_new {
+        if looped || generated.len() >= max_new {
+            let why = if looped {
+                format!("fell into a loop after {} tokens", generated.len())
+            } else {
+                format!("hit the {max_new}-token cap")
+            };
+            let text = self.tokenizer.decode(&generated, true).unwrap_or_default();
             log::warn!(
-                "decode hit the {max_new}-token cap without an end-of-turn token; \
-                 returning what it produced"
+                "the decode {why} without an end-of-turn token; keeping the piece as \
+                 it was. It wrote: {text:?}"
             );
+            return Ok(None);
         }
         let text = self
             .tokenizer
@@ -680,8 +718,24 @@ impl Engine {
             prompt_tokens.len(),
             f64::from(generated_count) / elapsed.max(f64::EPSILON)
         );
-        Ok(text.trim().to_string())
+        Ok(Some(text.trim().to_string()))
     }
+}
+
+/// Whether the last tokens of `generated` are one short cycle over and over:
+/// a cycle of at most [`MAX_LOOP_PERIOD`] tokens, repeated until it spans
+/// [`LOOP_SPAN`] tokens and at least three cycles.
+fn loops(generated: &[u32]) -> bool {
+    (1..=MAX_LOOP_PERIOD).any(|period| {
+        let span = LOOP_SPAN.max(3 * period);
+        generated.len() >= span && {
+            let tail = &generated[generated.len() - span..];
+            tail[period..]
+                .iter()
+                .zip(tail)
+                .all(|(later, earlier)| later == earlier)
+        }
+    })
 }
 
 /// The stop tokens of a Qwen3 tokenizer, which must have `<|im_end|>`.
@@ -859,6 +913,46 @@ mod tests {
         );
     }
 
+    /// The loop that found this: "to allow them", over and over, after a take
+    /// cut off mid-sentence. Stopped a few cycles in.
+    #[test]
+    fn a_phrase_said_over_and_over_is_a_loop() {
+        let phrase = [11, 22, 33];
+        let mut generated = vec![1, 2, 3, 4, 5];
+        let mut stopped_at = None;
+        for n in 0..100 {
+            generated.extend(phrase);
+            if loops(&generated) {
+                stopped_at = Some(n);
+                break;
+            }
+        }
+        // 32 tokens of a 3-token cycle: the eleventh time round.
+        assert_eq!(stopped_at, Some(10));
+    }
+
+    /// Dictation repeats itself too, but never for long.
+    #[test]
+    fn the_repeats_dictation_has_are_not_a_loop() {
+        // "no no no no no": one token, five times.
+        assert!(!loops(&[9, 9, 9, 9, 9]));
+        // "copy and paste them or yeah copy and paste them".
+        assert!(!loops(&[1, 2, 3, 4, 5, 6, 1, 2, 3, 4]));
+        // A cycle longer than any phrase loop is left to the cap.
+        let long_cycle: Vec<u32> = (0..17).cycle().take(200).collect();
+        assert!(!loops(&long_cycle));
+        // Ordinary text with no cycle in its tail.
+        let text: Vec<u32> = (0..200).collect();
+        assert!(!loops(&text));
+    }
+
+    /// A one-token loop is caught too, once it spans the whole window.
+    #[test]
+    fn one_token_over_and_over_is_a_loop() {
+        assert!(!loops(&[7; LOOP_SPAN - 1]));
+        assert!(loops(&[7; LOOP_SPAN]));
+    }
+
     fn load_fixture(backend: &fixture::Backend) -> Result<Engine, LoadError> {
         Engine::load(&backend.dir, fixture::MODEL, None, &|_| {})
     }
@@ -892,6 +986,8 @@ mod tests {
         assert_ne!(steps[..first_warm], []);
         assert!(reports.iter().filter_map(|r| r.progress).all(|p| p < 1.0));
 
+        // The fixture writes noise and never ends its turn, so the piece
+        // comes back as it went in.
         let text = engine
             .normalize(
                 "so um hello there",
@@ -899,12 +995,13 @@ mod tests {
                 &AtomicBool::new(false),
             )
             .unwrap();
-        assert!(text.len() < 4 * MAX_NEW_TOKENS, "{text:?}");
+        assert_eq!(text, "so um hello there");
         engine.release();
     }
 
-    /// A transcript over the budget is cut, every piece is decoded, and a
-    /// raised cancel stops the first piece at its first token.
+    /// A transcript over the budget is cut, every piece is decoded and comes
+    /// back with its words, and a raised cancel stops the first piece at its
+    /// first token.
     #[test]
     fn a_long_transcript_goes_in_pieces_and_a_cancel_stops_it() {
         let backend = fixture::backend();
@@ -916,9 +1013,11 @@ mod tests {
             chunk::chunk(&long, INPUT_TOKEN_BUDGET, |s| engine.count_tokens(s)).len(),
             2
         );
-        engine
+        // Neither piece's decode ends its turn: both keep their words.
+        let text = engine
             .normalize(&long, Control::default(), &AtomicBool::new(false))
             .unwrap();
+        assert_eq!(text, long.trim());
         let err = engine
             .normalize(&long, Control::default(), &AtomicBool::new(true))
             .unwrap_err();
