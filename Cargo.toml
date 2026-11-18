@@ -4,7 +4,7 @@
 
 [package]
   name        = "super-voice-backend-s1-mini"
-  version     = "0.2.0"
+  version     = "0.2.1"
   edition     = "2024"
   description = "S1-mini transcript post-processor for Super Voice."
   repository  = "https://github.com/super-libre/super-voice-s1-mini"
